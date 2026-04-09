@@ -2503,6 +2503,23 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		}
 	}
 
+	/**
+	 * 执行任务主请求循环的“一轮或多轮”调度（使用显式栈而非函数递归）。
+	 *
+	 * 核心逻辑：
+	 * 1) 以 `StackItem` 为单位驱动请求重试与续轮，逐项处理 userContent。
+	 * 2) 每轮先做前置处理：限速等待、环境信息拼装、消息入历史、UI 状态更新。
+	 * 3) 发起流式 LLM 请求并在流中解析 text/tool_use，执行工具并把 tool_result 先暂存到 `userMessageContent`。
+	 * 4) 等待本轮工具结果收集完成（`userMessageContentReady`），将结果压栈进入下一轮请求。
+	 * 5) 处理异常分支：空响应重试、自动/手动重试、上下文错误与中止流程，必要时修正历史避免连续 user 消息。
+	 *
+	 * 返回值语义：
+	 * - `true`：通知外层循环应结束任务（如致命错误或中止路径）。
+	 * - `false`：本方法正常返回，外层可继续后续流程（当前实现大多数正常路径返回 false）。
+	 *
+	 * @param userContent 本轮起始的用户内容块（文本/图片/tool_result 等）
+	 * @param includeFileDetails 是否在本轮环境信息中包含详细文件列表（通常仅首轮为 true）
+	 */
 	public async recursivelyMakeClineRequests(
 		userContent: Anthropic.Messages.ContentBlockParam[],
 		includeFileDetails: boolean = false,
@@ -3984,6 +4001,20 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		}
 	}
 
+	/**
+	 * 发起一次可重试的流式 API 请求，并按“首包成功后持续转发”的策略产出流数据。
+	 *
+	 * 核心逻辑：
+	 * 1) 读取运行态配置（限速、自动审批、上下文管理等），必要时先执行 provider 限速等待。
+	 * 2) 在正式请求前进行上下文管理（condense / sliding-window 截断），并把结果同步到历史与 UI。
+	 * 3) 构造最终请求载荷（系统提示词、清洗后的会话历史、工具元数据、allowedFunctionNames）。
+	 * 4) 创建可中止的流式请求，首包阶段用 `Promise.race` 与 abort 信号竞争，确保“首包失败”可被单独处理。
+	 * 5) 首包失败时按错误类型分流：上下文超限自动处理后重试；其余错误走自动重试或用户确认重试。
+	 * 6) 首包成功后，将剩余分片 `yield*` 透传给上层；中途错误交由上层流处理逻辑接管。
+	 *
+	 * 设计目的：把“上下文治理 + 请求构建 + 首包鲁棒重试 + 流式转发”集中在单入口，
+	 * 既保证历史一致性，也提高失败场景下的可恢复性。
+	 */
 	public async *attemptApiRequest(
 		retryAttempt: number = 0,
 		options: { skipProviderRateLimit?: boolean } = {},
@@ -4003,6 +4034,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		// Get condensing configuration for automatic triggers.
 		const customCondensingPrompt = state?.customSupportPrompts?.CONDENSE
 
+		// 步骤 1：按 provider 配置执行请求限速（可由调用方显式跳过）
 		if (!options.skipProviderRateLimit) {
 			await this.maybeWaitForProviderRateLimit(retryAttempt)
 		}
@@ -4019,6 +4051,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		const systemPrompt = await this.getSystemPrompt()
 		const { contextTokens } = this.getTokenUsage()
 
+		// 步骤 2：在请求前做上下文管理（必要时 condense / 截断）
 		if (contextTokens) {
 			const modelInfo = this.api.getModel().info
 
@@ -4044,6 +4077,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 					: await this.api.countTokens([{ type: "text", text: lastMessageContent as string }])
 			}
 
+			// 先做“是否会触发上下文管理”的预判，用于 UI 提前展示进行中状态
 			const contextManagementWillRun = willManageContext({
 				totalTokens: contextTokens,
 				contextWindow,
@@ -4112,6 +4146,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 					: undefined
 
 			try {
+				// 统一入口：根据阈值与配置执行 condense 或 sliding-window 截断
 				const truncateResult = await manageContext({
 					messages: this.apiConversationHistory,
 					totalTokens: contextTokens,
@@ -4131,6 +4166,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 					cwd: this.cwd,
 					rooIgnoreController: this.rooIgnoreController,
 				})
+				// 若上下文管理返回了新消息集，立即落盘替换，保证后续请求与历史一致
 				if (truncateResult.messages !== this.apiConversationHistory) {
 					await this.overwriteApiConversationHistory(truncateResult.messages)
 				}
@@ -4138,6 +4174,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 					await this.say("condense_context_error", truncateResult.error)
 				}
 				if (truncateResult.summary) {
+					// condense 成功：发送摘要型系统消息，便于 UI/历史回放
 					const { summary, cost, prevContextTokens, newContextTokens = 0, condenseId } = truncateResult
 					const contextCondense: ContextCondense = {
 						summary,
@@ -4188,6 +4225,9 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			}
 		}
 
+		// 步骤 3：构建最终请求消息
+		// 先取有效历史（过滤被压缩标记的消息），再做 user 连续轮次合并与图片裁剪
+		// 最后按协议清洗 reasoning，得到可直接提交给 provider 的会话历史
 		// Get the effective API history by filtering out condensed messages
 		// This allows non-destructive condensing where messages are tagged but not deleted,
 		// enabling accurate rewind operations while still sending condensed history to the API.
@@ -4199,6 +4239,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		const messagesWithoutImages = maybeRemoveImageBlocks(mergedForApi, this.api)
 		const cleanConversationHistory = this.buildCleanConversationHistory(messagesWithoutImages as ApiMessage[])
 
+		// 步骤 4：请求前检查自动审批额度，超限则中断本次继续执行
 		// Check auto-approval limits
 		const approvalResult = await this.autoApprovalHandler.checkAutoApprovalLimits(
 			state,
@@ -4214,6 +4255,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		// Whether we include tools is determined by whether we have any tools to send.
 		const modelInfo = this.api.getModel().info
 
+		// 步骤 5：构建工具元数据（native + MCP），并按 provider 能力决定是否传 all tools + allowedFunctionNames
 		// Build complete tools array: native tools + dynamic MCP tools
 		// When includeAllToolsWithRestrictions is true, returns all tools but provides
 		// allowedFunctionNames for providers (like Gemini) that need to see all tool
@@ -4268,6 +4310,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				: {}),
 		}
 
+		// 步骤 6：创建可中止的流式请求
 		// Create an AbortController to allow cancelling the request mid-stream
 		this.currentRequestAbortController = new AbortController()
 		const abortSignal = this.currentRequestAbortController.signal
@@ -4289,6 +4332,8 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		})
 
 		try {
+			// 步骤 7：首包探测
+			// 只对“首包阶段”做专门容错与重试分流，避免把中途流错误混入同一路径
 			// Awaiting first chunk to see if it will throw an error.
 			this.isWaitingForFirstChunk = true
 
@@ -4308,6 +4353,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			yield firstChunk.value
 			this.isWaitingForFirstChunk = false
 		} catch (error) {
+			// 首包失败分流处理：上下文超限优先自动修复，其它错误按自动/手动重试路径处理
 			this.isWaitingForFirstChunk = false
 			this.currentRequestAbortController = undefined
 			const isContextWindowExceededError = checkContextWindowExceededError(error)
@@ -4320,13 +4366,14 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 						`Attempting automatic truncation...`,
 				)
 				await this.handleContextWindowExceededError()
-				// Retry the request after handling the context window error
+				// 处理完成后递归重试，并透传重试流
 				yield* this.attemptApiRequest(retryAttempt + 1)
 				return
 			}
 
 			// note that this api_req_failed ask is unique in that we only present this option if the api hasn't streamed any content yet (ie it fails on the first chunk due), as it would allow them to hit a retry button. However if the api failed mid-stream, it could be in any arbitrary state where some tools may have executed, so that error is handled differently and requires cancelling the task entirely.
 			if (autoApprovalEnabled) {
+				// 自动模式：指数退避 + 倒计时提示后自动重试
 				// Apply shared exponential backoff and countdown UX
 				await this.backoffAndAnnounce(retryAttempt, error)
 
@@ -4345,6 +4392,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 				return
 			} else {
+				// 非自动模式：向用户询问是否重试
 				const { response } = await this.ask(
 					"api_req_failed",
 					error.message ?? JSON.stringify(serializeError(error), null, 2),
@@ -4364,6 +4412,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			}
 		}
 
+		// 步骤 8：首包成功后，直接把后续流分片透传给上层消费方
 		// No error, so we can continue to yield all remaining chunks.
 		// (Needs to be placed outside of try/catch since it we want caller to
 		// handle errors not with api_req_failed as that is reserved for first
@@ -4455,6 +4504,19 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		return checkpointSave(this, force, suppressMessage)
 	}
 
+	/**
+	 * 构建“可发送给模型”的干净会话历史。
+	 *
+	 * 核心逻辑：
+	 * 1) 遍历持久化消息并按协议清洗 `reasoning` 相关内容，避免把仅用于历史展示的数据原样回传给 API。
+	 * 2) 对 assistant 消息做结构归一化（string/array 统一处理），识别首块是否为 reasoning，并按类型分流：
+	 *    - 加密 reasoning：拆成独立 reasoning item + 去掉 reasoning 的 assistant 消息。
+	 *    - 明文 reasoning：根据模型 `preserveReasoning` 决定“保留”或“剥离”后再发送。
+	 *    - reasoning_details：按 provider 期望原样挂回 assistant 消息。
+	 * 3) 普通消息走兜底路径，保持 role/content 语义不变。
+	 *
+	 * 目标：在不丢失关键上下文的前提下，确保发送给下游 API 的消息格式稳定、字段合法、语义可回放。
+	 */
 	private buildCleanConversationHistory(
 		messages: ApiMessage[],
 	): Array<
@@ -4467,10 +4529,12 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			summary?: any[]
 		}
 
+		// 输出容器：最终仅包含“可直接发送给 API”的消息项
 		const cleanConversationHistory: (Anthropic.Messages.MessageParam | ReasoningItemForRequest)[] = []
 
 		for (const msg of messages) {
-			// Standalone reasoning: send encrypted, skip plain text
+			// 步骤 1：处理“独立 reasoning 消息”
+			// 仅发送加密内容；纯文本 reasoning 不走该分支回传（通常仅用于历史展示）
 			if (msg.type === "reasoning") {
 				if (msg.encrypted_content) {
 					cleanConversationHistory.push({
@@ -4483,10 +4547,12 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				continue
 			}
 
-			// Preferred path: assistant message with embedded reasoning as first content block
+			// 步骤 2：处理 assistant 消息（重点分支）
+			// 常见情况：reasoning 被嵌入在 content 的首个 block
 			if (msg.role === "assistant") {
 				const rawContent = msg.content
 
+				// 先把 content 归一化为数组，便于统一分析首块和剩余块
 				const contentArray: Anthropic.Messages.ContentBlockParam[] = Array.isArray(rawContent)
 					? (rawContent as Anthropic.Messages.ContentBlockParam[])
 					: rawContent !== undefined
@@ -4497,10 +4563,11 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 				const [first, ...rest] = contentArray
 
-				// Check if this message has reasoning_details (OpenRouter format for Gemini 3, etc.)
+				// 分支 A：provider 专有 `reasoning_details`（如 OpenRouter/Gemini 3）
+				// 该字段需要挂在 assistant 消息上原样回传
 				const msgWithDetails = msg
 				if (msgWithDetails.reasoning_details && Array.isArray(msgWithDetails.reasoning_details)) {
-					// Build the assistant message with reasoning_details
+					// 构建带 reasoning_details 的 assistant 消息
 					let assistantContent: Anthropic.Messages.MessageParam["content"]
 
 					if (contentArray.length === 0) {
@@ -4511,7 +4578,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 						assistantContent = contentArray
 					}
 
-					// Create message with reasoning_details property
+					// 推入“含 reasoning_details”的 assistant 消息
 					cleanConversationHistory.push({
 						role: "assistant",
 						content: assistantContent,
@@ -4521,7 +4588,9 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 					continue
 				}
 
-				// Embedded reasoning: encrypted (send) or plain text (skip)
+				// 分支 B/C：首块为嵌入式 reasoning
+				// B = 加密 reasoning（拆分发送）
+				// C = 明文 reasoning（按模型配置决定保留/剥离）
 				const hasEncryptedReasoning =
 					first && (first as any).type === "reasoning" && typeof (first as any).encrypted_content === "string"
 				const hasPlainTextReasoning =
@@ -4530,7 +4599,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				if (hasEncryptedReasoning) {
 					const reasoningBlock = first as any
 
-					// Send as separate reasoning item (OpenAI Native)
+					// B1. 加密 reasoning 作为独立 item 发送（适配 OpenAI Native 等协议）
 					cleanConversationHistory.push({
 						type: "reasoning",
 						summary: reasoningBlock.summary ?? [],
@@ -4538,7 +4607,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 						...(reasoningBlock.id ? { id: reasoningBlock.id } : {}),
 					})
 
-					// Send assistant message without reasoning
+					// B2. assistant 消息中移除 reasoning，仅保留正文/工具块等可回传内容
 					let assistantContent: Anthropic.Messages.MessageParam["content"]
 
 					if (rest.length === 0) {
@@ -4556,17 +4625,17 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 					continue
 				} else if (hasPlainTextReasoning) {
-					// Check if the model's preserveReasoning flag is set
-					// If true, include the reasoning block in API requests
-					// If false/undefined, strip it out (stored for history only, not sent back to API)
+					// C1. 明文 reasoning 根据模型开关决定是否回传：
+					// preserveReasoning=true  -> 保留
+					// false/undefined         -> 剥离（仅留在历史，不回传 API）
 					const shouldPreserveForApi = this.api.getModel().info.preserveReasoning === true
 					let assistantContent: Anthropic.Messages.MessageParam["content"]
 
 					if (shouldPreserveForApi) {
-						// Include reasoning block in the content sent to API
+						// 保留 reasoning block 一起发送
 						assistantContent = contentArray
 					} else {
-						// Strip reasoning out - stored for history only, not sent back to API
+						// 剥离 reasoning，只发送剩余有效内容
 						if (rest.length === 0) {
 							assistantContent = ""
 						} else if (rest.length === 1 && rest[0].type === "text") {
@@ -4585,7 +4654,8 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				}
 			}
 
-			// Default path for regular messages (no embedded reasoning)
+			// 步骤 3：默认兜底路径（普通 user/assistant 消息）
+			// 不涉及 reasoning 清洗时，按原 role/content 透传
 			if (msg.role) {
 				cleanConversationHistory.push({
 					role: msg.role,

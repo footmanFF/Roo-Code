@@ -528,6 +528,17 @@ export function getMessagesSinceLastSummary(messages: ApiMessage[]): ApiMessage[
 }
 
 /**
+ * 中文说明：
+ * 该方法用于从完整的 API 历史中计算“实际应发送给模型”的有效历史。
+ * 它不会破坏原始消息，而是基于 summary/condenseParent/truncationParent 等标记做过滤，
+ * 从而同时满足：
+ * - 对模型发送精简后的上下文（避免窗口膨胀）
+ * - 在本地保留完整历史（支持 rewind/恢复等能力）
+ *
+ * 核心处理分为两条路径：
+ * 1) 存在最新 summary：走 fresh-start，只保留从 summary 起的消息，并清理孤立 tool_result，再过滤被 truncation 隐藏的消息。
+ * 2) 不存在 summary：按 condenseParent 与 truncationParent 对应标记是否仍存在来过滤；父标记已丢失（孤儿引用）则保留消息。
+ *
  * Filters the API conversation history to get the "effective" messages to send to the API.
  *
  * Fresh Start Model:

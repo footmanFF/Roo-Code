@@ -8,7 +8,8 @@ import { DEFAULT_MAX_SEARCH_RESULTS, DEFAULT_SEARCH_MIN_SCORE, QDRANT_CODE_BLOCK
 import { t } from "../../../i18n"
 
 /**
- * Qdrant implementation of the vector store interface
+ * IVectorStore 的 Qdrant 实现。
+ * 负责集合初始化、向量写入、相似度检索、按文件删除以及索引完成状态标记。
  */
 export class QdrantVectorStore implements IVectorStore {
 	private readonly vectorSize!: number
@@ -20,36 +21,39 @@ export class QdrantVectorStore implements IVectorStore {
 	private readonly workspacePath: string
 
 	/**
-	 * Creates a new Qdrant vector store
-	 * @param workspacePath Path to the workspace
-	 * @param url Optional URL to the Qdrant server
+	 * 创建 Qdrant 向量存储实例。
+	 *
+	 * @param workspacePath 工作区路径（用于生成隔离的集合名）
+	 * @param url           Qdrant 服务地址
+	 * @param vectorSize    向量维度（必须与 embedding 模型一致）
+	 * @param apiKey        可选 API Key
 	 */
 	constructor(workspacePath: string, url: string, vectorSize: number, apiKey?: string) {
-		// Parse the URL to determine the appropriate QdrantClient configuration
+		// 先规范化 URL，确保支持 hostname、host:port、完整 URL 等多种输入形式
 		const parsedUrl = this.parseQdrantUrl(url)
 
-		// Store the resolved URL for our property
+		// 保存解析后的 URL，供错误提示与诊断使用
 		this.qdrantUrl = parsedUrl
 		this.workspacePath = workspacePath
 
 		try {
 			const urlObj = new URL(parsedUrl)
 
-			// Always use host-based configuration with explicit ports to avoid QdrantClient defaults
+			// 统一使用 host/port 方式构造客户端，避免 SDK 默认端口导致歧义
 			let port: number
 			let useHttps: boolean
 
 			if (urlObj.port) {
-				// Explicit port specified - use it and determine protocol
+				// URL 显式携带端口时，直接使用
 				port = Number(urlObj.port)
 				useHttps = urlObj.protocol === "https:"
 			} else {
-				// No explicit port - use protocol defaults
+				// 未显式端口时按协议推断默认端口
 				if (urlObj.protocol === "https:") {
 					port = 443
 					useHttps = true
 				} else {
-					// http: or other protocols default to port 80
+					// http 或其他协议默认 80
 					port = 80
 					useHttps = false
 				}
@@ -66,8 +70,8 @@ export class QdrantVectorStore implements IVectorStore {
 				},
 			})
 		} catch (urlError) {
-			// If URL parsing fails, fall back to URL-based config
-			// Note: This fallback won't correctly handle prefixes, but it's a last resort for malformed URLs.
+			// URL 解析失败时降级使用 url 直传模式（兜底）
+			// 注意：该模式对 prefix 的处理能力较弱，仅用于容错
 			this.client = new QdrantClient({
 				url: parsedUrl,
 				apiKey,
@@ -77,56 +81,68 @@ export class QdrantVectorStore implements IVectorStore {
 			})
 		}
 
-		// Generate collection name from workspace path
+		// 基于 workspacePath 生成稳定且隔离的集合名，避免不同工程冲突
 		const hash = createHash("sha256").update(workspacePath).digest("hex")
 		this.vectorSize = vectorSize
 		this.collectionName = `ws-${hash.substring(0, 16)}`
 	}
 
 	/**
-	 * Parses and normalizes Qdrant server URLs to handle various input formats
-	 * @param url Raw URL input from user
-	 * @returns Properly formatted URL for QdrantClient
+	 * 解析并规范化 Qdrant 服务地址。
+	 *
+	 * 支持输入：
+	 * - `localhost`
+	 * - `localhost:6333`
+	 * - `http://localhost:6333`
+	 * - `https://host/prefix`
+	 *
+	 * @param url 原始 URL 输入
+	 * @returns   可用于 QdrantClient 的规范化 URL
 	 */
 	private parseQdrantUrl(url: string | undefined): string {
-		// Handle undefined/null/empty cases
+		// 空值时回退到默认本地地址
 		if (!url || url.trim() === "") {
 			return "http://localhost:6333"
 		}
 
 		const trimmedUrl = url.trim()
 
-		// Check if it starts with a protocol
+		// 未携带协议时按 hostname 处理并补全协议
 		if (!trimmedUrl.startsWith("http://") && !trimmedUrl.startsWith("https://") && !trimmedUrl.includes("://")) {
-			// No protocol - treat as hostname
 			return this.parseHostname(trimmedUrl)
 		}
 
 		try {
-			// Attempt to parse as complete URL - return as-is, let constructor handle ports
-			const parsedUrl = new URL(trimmedUrl)
+			// 能被 URL 正常解析则直接返回，端口细节交给构造函数处理
+			new URL(trimmedUrl)
 			return trimmedUrl
 		} catch {
-			// Failed to parse as URL - treat as hostname
+			// 解析失败，兜底按 hostname 处理
 			return this.parseHostname(trimmedUrl)
 		}
 	}
 
 	/**
-	 * Handles hostname-only inputs
-	 * @param hostname Raw hostname input
-	 * @returns Properly formatted URL with http:// prefix
+	 * 处理 hostname 形式输入并补全协议。
+	 *
+	 * @param hostname 原始主机名（可能含端口）
+	 * @returns        规范化 URL（默认补 `http://`）
 	 */
 	private parseHostname(hostname: string): string {
 		if (hostname.includes(":")) {
-			// Has port - add http:// prefix if missing
+			// 携带端口时仅补协议
 			return hostname.startsWith("http") ? hostname : `http://${hostname}`
 		} else {
-			// No port - add http:// prefix without port (let constructor handle port assignment)
+			// 不含端口时补协议，端口后续由协议默认值决定
 			return `http://${hostname}`
 		}
 	}
 
+	/**
+	 * 获取集合信息。
+	 *
+	 * @returns 集合信息；不存在或读取失败时返回 null
+	 */
 	private async getCollectionInfo(): Promise<Schemas["CollectionInfo"] | null> {
 		try {
 			const collectionInfo = await this.client.getCollection(this.collectionName)
@@ -143,8 +159,15 @@ export class QdrantVectorStore implements IVectorStore {
 	}
 
 	/**
-	 * Initializes the vector store
-	 * @returns Promise resolving to boolean indicating if a new collection was created
+	 * 初始化向量存储集合。
+	 *
+	 * 逻辑：
+	 * 1) 检查集合是否存在
+	 * 2) 不存在则创建
+	 * 3) 存在则校验维度，不一致时重建
+	 * 4) 创建 payload 索引
+	 *
+	 * @returns `true` 表示创建了新集合，`false` 表示复用了已有集合
 	 */
 	async initialize(): Promise<boolean> {
 		let created = false
@@ -152,7 +175,7 @@ export class QdrantVectorStore implements IVectorStore {
 			const collectionInfo = await this.getCollectionInfo()
 
 			if (collectionInfo === null) {
-				// Collection info not retrieved (assume not found or inaccessible), create it
+				// 未获取到集合信息（通常是不存在），直接创建
 				await this.client.createCollection(this.collectionName, {
 					vectors: {
 						size: this.vectorSize,
@@ -167,7 +190,7 @@ export class QdrantVectorStore implements IVectorStore {
 				})
 				created = true
 			} else {
-				// Collection exists, check vector size
+				// 集合已存在，校验向量维度是否与当前模型一致
 				const vectorsConfig = collectionInfo.config?.params?.vectors
 				let existingVectorSize: number
 
@@ -181,18 +204,18 @@ export class QdrantVectorStore implements IVectorStore {
 				) {
 					existingVectorSize = vectorsConfig.size
 				} else {
-					existingVectorSize = 0 // Fallback for unknown configuration
+					existingVectorSize = 0 // 未知配置结构时使用兜底值
 				}
 
 				if (existingVectorSize === this.vectorSize) {
-					created = false // Exists and correct
+					created = false // 维度一致，可复用
 				} else {
-					// Exists but wrong vector size, recreate with enhanced error handling
+					// 维度不一致：必须重建集合，避免写入/检索维度错误
 					created = await this._recreateCollectionWithNewDimension(existingVectorSize)
 				}
 			}
 
-			// Create payload indexes
+			// 为检索过滤字段创建 payload 索引，提高查询性能
 			await this._createPayloadIndexes()
 			return created
 		} catch (error: any) {
@@ -202,12 +225,12 @@ export class QdrantVectorStore implements IVectorStore {
 				errorMessage,
 			)
 
-			// If this is already a vector dimension mismatch error (identified by cause), re-throw it as-is
+			// 若已是“维度不匹配重建失败”的包装错误，直接透传
 			if (error instanceof Error && error.cause !== undefined) {
 				throw error
 			}
 
-			// Otherwise, provide a more user-friendly error message that includes the original error
+			// 其余错误包装为更友好的连接失败提示
 			throw new Error(
 				t("embeddings:vectorStore.qdrantConnectionFailed", { qdrantUrl: this.qdrantUrl, errorMessage }),
 			)
@@ -215,9 +238,10 @@ export class QdrantVectorStore implements IVectorStore {
 	}
 
 	/**
-	 * Recreates the collection with a new vector dimension, handling failures gracefully.
-	 * @param existingVectorSize The current vector size of the existing collection
-	 * @returns Promise resolving to boolean indicating if a new collection was created
+	 * 在维度变化时重建集合，并尽可能提供可诊断的分阶段错误信息。
+	 *
+	 * @param existingVectorSize 现有集合维度
+	 * @returns                  `true` 表示成功按新维度创建
 	 */
 	private async _recreateCollectionWithNewDimension(existingVectorSize: number): Promise<boolean> {
 		console.warn(
@@ -228,22 +252,22 @@ export class QdrantVectorStore implements IVectorStore {
 		let recreationAttempted = false
 
 		try {
-			// Step 1: Attempt to delete the existing collection
+			// 1) 删除旧集合
 			console.log(`[QdrantVectorStore] Deleting existing collection ${this.collectionName}...`)
 			await this.client.deleteCollection(this.collectionName)
 			deletionSucceeded = true
 			console.log(`[QdrantVectorStore] Successfully deleted collection ${this.collectionName}`)
 
-			// Step 2: Wait a brief moment to ensure deletion is processed
+			// 2) 短暂等待，确保删除操作已落地
 			await new Promise((resolve) => setTimeout(resolve, 100))
 
-			// Step 3: Verify the collection is actually deleted
+			// 3) 二次确认集合确实已删除
 			const verificationInfo = await this.getCollectionInfo()
 			if (verificationInfo !== null) {
 				throw new Error("Collection still exists after deletion attempt")
 			}
 
-			// Step 4: Create the new collection with correct dimensions
+			// 4) 按新维度重建集合
 			console.log(
 				`[QdrantVectorStore] Creating new collection ${this.collectionName} with vector size ${this.vectorSize}...`,
 			)
@@ -265,7 +289,7 @@ export class QdrantVectorStore implements IVectorStore {
 		} catch (recreationError) {
 			const errorMessage = recreationError instanceof Error ? recreationError.message : String(recreationError)
 
-			// Provide detailed error context based on what stage failed
+			// 按失败阶段拼装上下文，帮助快速定位是“删失败”“校验失败”还是“重建失败”
 			let contextualErrorMessage: string
 			if (!deletionSucceeded) {
 				contextualErrorMessage = `Failed to delete existing collection with vector size ${existingVectorSize}. ${errorMessage}`
@@ -279,24 +303,25 @@ export class QdrantVectorStore implements IVectorStore {
 				`[QdrantVectorStore] CRITICAL: Failed to recreate collection ${this.collectionName} for dimension change (${existingVectorSize} -> ${this.vectorSize}). ${contextualErrorMessage}`,
 			)
 
-			// Create a comprehensive error message for the user
+			// 对外抛出更可读的错误信息
 			const dimensionMismatchError = new Error(
 				t("embeddings:vectorStore.vectorDimensionMismatch", {
 					errorMessage: contextualErrorMessage,
 				}),
 			)
 
-			// Preserve the original error context
+			// 保留底层错误作为 cause
 			dimensionMismatchError.cause = recreationError
 			throw dimensionMismatchError
 		}
 	}
 
 	/**
-	 * Creates payload indexes for the collection, handling errors gracefully.
+	 * 为集合创建 payload 索引（容错处理）。
+	 * 已存在索引不视为错误，其他错误仅告警不阻塞主流程。
 	 */
 	private async _createPayloadIndexes(): Promise<void> {
-		// Create index for the 'type' field to enable metadata filtering
+		// 为 type 字段建索引，用于排除 metadata 点
 		try {
 			await this.client.createPayloadIndex(this.collectionName, {
 				field_name: "type",
@@ -312,7 +337,7 @@ export class QdrantVectorStore implements IVectorStore {
 			}
 		}
 
-		// Create indexes for pathSegments fields
+		// 为 pathSegments.0~4 建索引，加速目录前缀过滤
 		for (let i = 0; i <= 4; i++) {
 			try {
 				await this.client.createPayloadIndex(this.collectionName, {
@@ -332,8 +357,11 @@ export class QdrantVectorStore implements IVectorStore {
 	}
 
 	/**
-	 * Upserts points into the vector store
-	 * @param points Array of points to upsert
+	 * 批量写入（upsert）向量点。
+	 *
+	 * 会将 filePath 预处理为 `pathSegments`，以便后续按目录/文件快速过滤。
+	 *
+	 * @param points 待写入的点集合
 	 */
 	async upsertPoints(
 		points: Array<{
@@ -343,6 +371,7 @@ export class QdrantVectorStore implements IVectorStore {
 		}>,
 	): Promise<void> {
 		try {
+			// 在写入前补充 pathSegments（按路径段拆分后的可过滤字段）
 			const processedPoints = points.map((point) => {
 				if (point.payload?.filePath) {
 					const segments = point.payload.filePath.split(path.sep).filter(Boolean)
@@ -375,9 +404,10 @@ export class QdrantVectorStore implements IVectorStore {
 	}
 
 	/**
-	 * Checks if a payload is valid
-	 * @param payload Payload to check
-	 * @returns Boolean indicating if the payload is valid
+	 * 校验 payload 是否具备最小可用字段。
+	 *
+	 * @param payload 待校验 payload
+	 * @returns       是否为合法检索结果 payload
 	 */
 	private isPayloadValid(payload: Record<string, unknown> | null | undefined): payload is Payload {
 		if (!payload) {
@@ -389,12 +419,13 @@ export class QdrantVectorStore implements IVectorStore {
 	}
 
 	/**
-	 * Searches for similar vectors
-	 * @param queryVector Vector to search for
-	 * @param directoryPrefix Optional directory prefix to filter results
-	 * @param minScore Optional minimum score threshold
-	 * @param maxResults Optional maximum number of results to return
-	 * @returns Promise resolving to search results
+	 * 执行相似向量检索。
+	 *
+	 * @param queryVector     查询向量
+	 * @param directoryPrefix 可选目录前缀（用于路径过滤）
+	 * @param minScore        可选最小相似度阈值
+	 * @param maxResults      可选最大返回数量
+	 * @returns               检索结果列表
 	 */
 	async search(
 		queryVector: number[],
@@ -411,14 +442,13 @@ export class QdrantVectorStore implements IVectorStore {
 				| undefined = undefined
 
 			if (directoryPrefix) {
-				// Check if the path represents current directory
+				// 统一路径分隔符并标准化，便于跨平台匹配
 				const normalizedPrefix = path.posix.normalize(directoryPrefix.replace(/\\/g, "/"))
-				// Note: path.posix.normalize("") returns ".", and normalize("./") returns "./"
+				// "." / "./" 代表当前目录，不做过滤（全工作区检索）
 				if (normalizedPrefix === "." || normalizedPrefix === "./") {
-					// Don't create a filter - search entire workspace
 					filter = undefined
 				} else {
-					// Remove leading "./" from paths like "./src" to normalize them
+					// 去掉前导 "./" 并按路径段拆分，映射为 pathSegments.N 过滤条件
 					const cleanedPrefix = path.posix.normalize(
 						normalizedPrefix.startsWith("./") ? normalizedPrefix.slice(2) : normalizedPrefix,
 					)
@@ -434,7 +464,7 @@ export class QdrantVectorStore implements IVectorStore {
 				}
 			}
 
-			// Always exclude metadata points at query-time to avoid wasting top-k
+			// 查询时始终排除 metadata 点，避免占用 top-k 名额
 			const metadataExclusion = {
 				must_not: [{ key: "type", match: { value: "metadata" } }],
 			}
@@ -457,6 +487,7 @@ export class QdrantVectorStore implements IVectorStore {
 				},
 			}
 
+			// 执行查询并过滤掉 payload 不完整的点
 			const operationResult = await this.client.query(this.collectionName, searchRequest)
 			const filteredPoints = operationResult.points.filter((p) => this.isPayloadValid(p.payload))
 
@@ -468,20 +499,27 @@ export class QdrantVectorStore implements IVectorStore {
 	}
 
 	/**
-	 * Deletes points by file path
-	 * @param filePath Path of the file to delete points for
+	 * 按单个文件路径删除向量点。
+	 *
+	 * @param filePath 文件路径
 	 */
 	async deletePointsByFilePath(filePath: string): Promise<void> {
 		return this.deletePointsByMultipleFilePaths([filePath])
 	}
 
+	/**
+	 * 按多个文件路径删除向量点。
+	 * 内部将每个文件路径转换为 pathSegments 过滤条件执行批量删除。
+	 *
+	 * @param filePaths 文件路径数组
+	 */
 	async deletePointsByMultipleFilePaths(filePaths: string[]): Promise<void> {
 		if (filePaths.length === 0) {
 			return
 		}
 
 		try {
-			// First check if the collection exists
+			// 先检查集合是否存在，避免无意义删除请求
 			const collectionExists = await this.collectionExists()
 			if (!collectionExists) {
 				console.warn(
@@ -492,20 +530,18 @@ export class QdrantVectorStore implements IVectorStore {
 
 			const workspaceRoot = this.workspacePath
 
-			// Build filters using pathSegments to match the indexed fields
+			// 基于 pathSegments 构建删除过滤条件，与 upsert 时写入结构保持一致
 			const filters = filePaths.map((filePath) => {
-				// IMPORTANT: Use the relative path to match what's stored in upsertPoints
-				// upsertPoints stores the relative filePath, not the absolute path
+				// 重要：upsert 存的是相对路径，这里必须统一转为相对路径再匹配
 				const relativePath = path.isAbsolute(filePath) ? path.relative(workspaceRoot, filePath) : filePath
 
-				// Normalize the relative path
+				// 规范化路径，避免分隔符差异
 				const normalizedRelativePath = path.normalize(relativePath)
 
-				// Split the path into segments like we do in upsertPoints
+				// 按路径段拆分，保持与 upsert 的 pathSegments 生成逻辑一致
 				const segments = normalizedRelativePath.split(path.sep).filter(Boolean)
 
-				// Create a filter that matches all segments of the path
-				// This ensures we only delete points that match the exact file path
+				// 仅当所有路径段都命中时才删除，避免误删同名前缀文件
 				const mustConditions = segments.map((segment, index) => ({
 					key: `pathSegments.${index}`,
 					match: { value: segment },
@@ -514,7 +550,7 @@ export class QdrantVectorStore implements IVectorStore {
 				return { must: mustConditions }
 			})
 
-			// Use 'should' to match any of the file paths (OR condition)
+			// 多文件时使用 should（OR）组合
 			const filter = filters.length === 1 ? filters[0] : { should: filters }
 
 			await this.client.delete(this.collectionName, {
@@ -522,7 +558,7 @@ export class QdrantVectorStore implements IVectorStore {
 				wait: true,
 			})
 		} catch (error: any) {
-			// Extract more detailed error information
+			// 记录更完整的错误上下文，便于定位删除失败原因
 			const errorMessage = error?.message || String(error)
 			const errorStatus = error?.status || error?.response?.status || error?.statusCode
 			const errorDetails = error?.response?.data || error?.data || ""
@@ -533,29 +569,29 @@ export class QdrantVectorStore implements IVectorStore {
 				details: errorDetails,
 				collection: this.collectionName,
 				fileCount: filePaths.length,
-				// Include first few file paths for debugging (avoid logging too many)
+				// 仅记录少量样本路径，避免日志过大
 				samplePaths: filePaths.slice(0, 3),
 			})
 		}
 	}
 
 	/**
-	 * Deletes the entire collection.
+	 * 删除整个集合。
 	 */
 	async deleteCollection(): Promise<void> {
 		try {
-			// Check if collection exists before attempting deletion to avoid errors
+			// 先判存再删，避免无意义异常
 			if (await this.collectionExists()) {
 				await this.client.deleteCollection(this.collectionName)
 			}
 		} catch (error) {
 			console.error(`[QdrantVectorStore] Failed to delete collection ${this.collectionName}:`, error)
-			throw error // Re-throw to allow calling code to handle it
+			throw error // 继续上抛给调用方处理
 		}
 	}
 
 	/**
-	 * Clears all points from the collection
+	 * 清空集合中的所有点（保留集合结构）。
 	 */
 	async clearCollection(): Promise<void> {
 		try {
@@ -572,8 +608,9 @@ export class QdrantVectorStore implements IVectorStore {
 	}
 
 	/**
-	 * Checks if the collection exists
-	 * @returns Promise resolving to boolean indicating if the collection exists
+	 * 检查集合是否存在。
+	 *
+	 * @returns 是否存在
 	 */
 	async collectionExists(): Promise<boolean> {
 		const collectionInfo = await this.getCollectionInfo()
@@ -581,8 +618,14 @@ export class QdrantVectorStore implements IVectorStore {
 	}
 
 	/**
-	 * Checks if the collection exists and has indexed points
-	 * @returns Promise resolving to boolean indicating if the collection exists and has points
+	 * 检查集合是否有可用索引数据。
+	 *
+	 * 判定顺序：
+	 * 1) 集合存在且 points_count > 0
+	 * 2) 若存在 metadata 标记点，则以 `indexing_complete` 为准
+	 * 3) 若无标记点（兼容旧版本），退化为 points_count > 0
+	 *
+	 * @returns 是否有可用索引数据
 	 */
 	async hasIndexedData(): Promise<boolean> {
 		try {
@@ -590,26 +633,24 @@ export class QdrantVectorStore implements IVectorStore {
 			if (!collectionInfo) {
 				return false
 			}
-			// Check if the collection has any points indexed
+			// 集合点数为 0 直接返回 false
 			const pointsCount = collectionInfo.points_count ?? 0
 			if (pointsCount === 0) {
 				return false
 			}
 
-			// Check if the indexing completion marker exists
-			// Use a deterministic UUID generated from a constant string
+			// 读取固定 metadata 点，判断本次索引是否完整结束
 			const metadataId = uuidv5("__indexing_metadata__", QDRANT_CODE_BLOCK_NAMESPACE)
 			const metadataPoints = await this.client.retrieve(this.collectionName, {
 				ids: [metadataId],
 			})
 
-			// If marker exists, use it to determine completion status
+			// 有标记点时，以显式完成标记为准
 			if (metadataPoints.length > 0) {
 				return metadataPoints[0].payload?.indexing_complete === true
 			}
 
-			// Backward compatibility: No marker exists (old index or pre-marker version)
-			// Fall back to old logic - assume complete if collection has points
+			// 向后兼容：旧索引无 metadata 标记，回退到 points_count 逻辑
 			console.log(
 				"[QdrantVectorStore] No indexing metadata marker found. Using backward compatibility mode (checking points_count > 0).",
 			)
@@ -621,13 +662,12 @@ export class QdrantVectorStore implements IVectorStore {
 	}
 
 	/**
-	 * Marks the indexing process as complete by storing metadata
-	 * Should be called after a successful full workspace scan or incremental scan
+	 * 将索引状态标记为“已完成”。
+	 * 通常在全量扫描或增量扫描成功结束后调用。
 	 */
 	async markIndexingComplete(): Promise<void> {
 		try {
-			// Create a metadata point with a deterministic UUID to mark indexing as complete
-			// Use uuidv5 to generate a consistent UUID from a constant string
+			// 使用固定 UUID 写 metadata 点，保证每次写入覆盖同一条记录
 			const metadataId = uuidv5("__indexing_metadata__", QDRANT_CODE_BLOCK_NAMESPACE)
 
 			await this.client.upsert(this.collectionName, {
@@ -652,13 +692,12 @@ export class QdrantVectorStore implements IVectorStore {
 	}
 
 	/**
-	 * Marks the indexing process as incomplete by storing metadata
-	 * Should be called at the start of indexing to indicate work in progress
+	 * 将索引状态标记为“进行中/未完成”。
+	 * 通常在索引开始前调用。
 	 */
 	async markIndexingIncomplete(): Promise<void> {
 		try {
-			// Create a metadata point with a deterministic UUID to mark indexing as incomplete
-			// Use uuidv5 to generate a consistent UUID from a constant string
+			// 使用固定 UUID 写 metadata 点，保证状态单点更新
 			const metadataId = uuidv5("__indexing_metadata__", QDRANT_CODE_BLOCK_NAMESPACE)
 
 			await this.client.upsert(this.collectionName, {

@@ -19,7 +19,6 @@ export interface IVectorStore {
 	 * @param points Array of points to upsert
 	 */
 	upsertPoints(points: PointStruct[]): Promise<void>
-
 	/**
 	 * Searches for similar vectors
 	 * @param queryVector Vector to search for
