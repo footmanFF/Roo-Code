@@ -2848,9 +2848,19 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 						}
 
 						switch (chunk.type) {
+							/*
+							 * chunk.type = "reasoning"
+							 * 类型：ApiStreamReasoningChunk（包含 reasoning 文本片段，核心字段是 text）
+							 * 处理：累计到 reasoningMessage，做标题换行格式化后以 partial 形式推送到 UI。
+							 */
 							case "reasoning":
 								reasoningMessage = await this.handleReasoningStreamChunk(chunk, reasoningMessage)
 								break
+							/*
+							 * chunk.type = "usage"
+							 * 类型：ApiStreamUsageChunk（包含 token/cost 统计，如 inputTokens/outputTokens/totalCost）
+							 * 处理：将本片段的 usage 累加到当前请求的统计变量，供后续计费与展示使用。
+							 */
 							case "usage": {
 								const usage = this.handleUsageStreamChunk(chunk, {
 									inputTokens,
@@ -2866,18 +2876,38 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 								totalCost = usage.totalCost
 								break
 							}
+							/*
+							 * chunk.type = "grounding"
+							 * 类型：ApiStreamGroundingChunk（包含来源引用数组 sources）
+							 * 处理：将引用来源累计到 pendingGroundingSources，待本轮响应结束后统一挂到消息中。
+							 */
 							case "grounding":
 								pendingGroundingSources = this.handleGroundingStreamChunk(
 									chunk,
 									pendingGroundingSources,
 								)
 								break
+							/*
+							 * chunk.type = "tool_call_partial"
+							 * 类型：ApiStreamToolCallPartialChunk（流式工具调用分片：id/name/arguments 增量）
+							 * 处理：交给 NativeToolCallParser 产生 start/delta/end 事件，维护 partial tool_use 状态并触发执行器更新。
+							 */
 							case "tool_call_partial":
 								await this.handleToolCallPartialStreamChunk(chunk)
 								break
+							/*
+							 * chunk.type = "tool_call"
+							 * 类型：ApiStreamToolCallChunk（完整工具调用块，兼容/回退路径）
+							 * 处理：解析为完整 ToolUse 后写入 assistantMessageContent，并唤起 presentAssistantMessage 执行。
+							 */
 							case "tool_call":
 								await this.handleToolCallStreamChunk(chunk)
 								break
+							/*
+							 * chunk.type = "text"
+							 * 类型：ApiStreamTextChunk（assistant 普通文本增量，核心字段是 text）
+							 * 处理：累计 assistantMessage，更新/创建 partial text block，并实时触发 UI 刷新。
+							 */
 							case "text":
 								assistantMessage = this.handleTextStreamChunk(chunk, assistantMessage)
 								break
