@@ -2848,208 +2848,39 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 						}
 
 						switch (chunk.type) {
-							case "reasoning": {
-								reasoningMessage += chunk.text
-								// Only apply formatting if the message contains sentence-ending punctuation followed by **
-								let formattedReasoning = reasoningMessage
-								if (reasoningMessage.includes("**")) {
-									// Add line breaks before **Title** patterns that appear after sentence endings
-									// This targets section headers like "...end of sentence.**Title Here**"
-									// Handles periods, exclamation marks, and question marks
-									formattedReasoning = reasoningMessage.replace(
-										/([.!?])\*\*([^*\n]+)\*\*/g,
-										"$1\n\n**$2**",
-									)
-								}
-								await this.say("reasoning", formattedReasoning, undefined, true)
+							case "reasoning":
+								reasoningMessage = await this.handleReasoningStreamChunk(chunk, reasoningMessage)
+								break
+							case "usage": {
+								const usage = this.handleUsageStreamChunk(chunk, {
+									inputTokens,
+									outputTokens,
+									cacheWriteTokens,
+									cacheReadTokens,
+									totalCost,
+								})
+								inputTokens = usage.inputTokens
+								outputTokens = usage.outputTokens
+								cacheWriteTokens = usage.cacheWriteTokens
+								cacheReadTokens = usage.cacheReadTokens
+								totalCost = usage.totalCost
 								break
 							}
-							case "usage":
-								inputTokens += chunk.inputTokens
-								outputTokens += chunk.outputTokens
-								cacheWriteTokens += chunk.cacheWriteTokens ?? 0
-								cacheReadTokens += chunk.cacheReadTokens ?? 0
-								totalCost = chunk.totalCost
-								break
 							case "grounding":
-								// Handle grounding sources separately from regular content
-								// to prevent state persistence issues - store them separately
-								if (chunk.sources && chunk.sources.length > 0) {
-									pendingGroundingSources.push(...chunk.sources)
-								}
+								pendingGroundingSources = this.handleGroundingStreamChunk(
+									chunk,
+									pendingGroundingSources,
+								)
 								break
-							case "tool_call_partial": {
-								// Process raw tool call chunk through NativeToolCallParser
-								// which handles tracking, buffering, and emits events
-								const events = NativeToolCallParser.processRawChunk({
-									index: chunk.index,
-									id: chunk.id,
-									name: chunk.name,
-									arguments: chunk.arguments,
-								})
-
-								for (const event of events) {
-									if (event.type === "tool_call_start") {
-										// Guard against duplicate tool_call_start events for the same tool ID.
-										// This can occur due to stream retry, reconnection, or API quirks.
-										// Without this check, duplicate tool_use blocks with the same ID would
-										// be added to assistantMessageContent, causing API 400 errors:
-										// "tool_use ids must be unique"
-										if (this.streamingToolCallIndices.has(event.id)) {
-											console.warn(
-												`[Task#${this.taskId}] Ignoring duplicate tool_call_start for ID: ${event.id} (tool: ${event.name})`,
-											)
-											continue
-										}
-
-										// Initialize streaming in NativeToolCallParser
-										NativeToolCallParser.startStreamingToolCall(event.id, event.name as ToolName)
-
-										// Before adding a new tool, finalize any preceding text block
-										// This prevents the text block from blocking tool presentation
-										const lastBlock =
-											this.assistantMessageContent[this.assistantMessageContent.length - 1]
-										if (lastBlock?.type === "text" && lastBlock.partial) {
-											lastBlock.partial = false
-										}
-
-										// Track the index where this tool will be stored
-										const toolUseIndex = this.assistantMessageContent.length
-										this.streamingToolCallIndices.set(event.id, toolUseIndex)
-
-										// Create initial partial tool use
-										const partialToolUse: ToolUse = {
-											type: "tool_use",
-											name: event.name as ToolName,
-											params: {},
-											partial: true,
-										}
-
-										// Store the ID for native protocol
-										;(partialToolUse as any).id = event.id
-
-										// Add to content and present
-										this.assistantMessageContent.push(partialToolUse)
-										this.userMessageContentReady = false
-										presentAssistantMessage(this)
-									} else if (event.type === "tool_call_delta") {
-										// Process chunk using streaming JSON parser
-										const partialToolUse = NativeToolCallParser.processStreamingChunk(
-											event.id,
-											event.delta,
-										)
-
-										if (partialToolUse) {
-											// Get the index for this tool call
-											const toolUseIndex = this.streamingToolCallIndices.get(event.id)
-											if (toolUseIndex !== undefined) {
-												// Store the ID for native protocol
-												;(partialToolUse as any).id = event.id
-
-												// Update the existing tool use with new partial data
-												this.assistantMessageContent[toolUseIndex] = partialToolUse
-
-												// Present updated tool use
-												presentAssistantMessage(this)
-											}
-										}
-									} else if (event.type === "tool_call_end") {
-										// Finalize the streaming tool call
-										const finalToolUse = NativeToolCallParser.finalizeStreamingToolCall(event.id)
-
-										// Get the index for this tool call
-										const toolUseIndex = this.streamingToolCallIndices.get(event.id)
-
-										if (finalToolUse) {
-											// Store the tool call ID
-											;(finalToolUse as any).id = event.id
-
-											// Get the index and replace partial with final
-											if (toolUseIndex !== undefined) {
-												this.assistantMessageContent[toolUseIndex] = finalToolUse
-											}
-
-											// Clean up tracking
-											this.streamingToolCallIndices.delete(event.id)
-
-											// Mark that we have new content to process
-											this.userMessageContentReady = false
-
-											// Present the finalized tool call
-											presentAssistantMessage(this)
-										} else if (toolUseIndex !== undefined) {
-											// finalizeStreamingToolCall returned null (malformed JSON or missing args)
-											// Mark the tool as non-partial so it's presented as complete, but execution
-											// will be short-circuited in presentAssistantMessage with a structured tool_result.
-											const existingToolUse = this.assistantMessageContent[toolUseIndex]
-											if (existingToolUse && existingToolUse.type === "tool_use") {
-												existingToolUse.partial = false
-												// Ensure it has the ID for native protocol
-												;(existingToolUse as any).id = event.id
-											}
-
-											// Clean up tracking
-											this.streamingToolCallIndices.delete(event.id)
-
-											// Mark that we have new content to process
-											this.userMessageContentReady = false
-
-											// Present the tool call - validation will handle missing params
-											presentAssistantMessage(this)
-										}
-									}
-								}
+							case "tool_call_partial":
+								await this.handleToolCallPartialStreamChunk(chunk)
 								break
-							}
-
-							case "tool_call": {
-								// Legacy: Handle complete tool calls (for backward compatibility)
-								// Convert native tool call to ToolUse format
-								const toolUse = NativeToolCallParser.parseToolCall({
-									id: chunk.id,
-									name: chunk.name as ToolName,
-									arguments: chunk.arguments,
-								})
-
-								if (!toolUse) {
-									console.error(`Failed to parse tool call for task ${this.taskId}:`, chunk)
-									break
-								}
-
-								// Store the tool call ID on the ToolUse object for later reference
-								// This is needed to create tool_result blocks that reference the correct tool_use_id
-								toolUse.id = chunk.id
-
-								// Add the tool use to assistant message content
-								this.assistantMessageContent.push(toolUse)
-
-								// Mark that we have new content to process
-								this.userMessageContentReady = false
-
-								// Present the tool call to user - presentAssistantMessage will execute
-								// tools sequentially and accumulate all results in userMessageContent
-								presentAssistantMessage(this)
+							case "tool_call":
+								await this.handleToolCallStreamChunk(chunk)
 								break
-							}
-							case "text": {
-								assistantMessage += chunk.text
-
-								// Native tool calling: text chunks are plain text.
-								// Create or update a text content block directly
-								const lastBlock = this.assistantMessageContent[this.assistantMessageContent.length - 1]
-								if (lastBlock?.type === "text" && lastBlock.partial) {
-									lastBlock.content = assistantMessage
-								} else {
-									this.assistantMessageContent.push({
-										type: "text",
-										content: assistantMessage,
-										partial: true,
-									})
-									this.userMessageContentReady = false
-								}
-								presentAssistantMessage(this)
+							case "text":
+								assistantMessage = this.handleTextStreamChunk(chunk, assistantMessage)
 								break
-							}
 						}
 
 						if (this.abort) {
@@ -3756,6 +3587,189 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 		// If we exit the while loop normally (stack is empty), return false
 		return false
+	}
+
+	/**
+	 * 处理 reasoning 分片并增量展示。
+	 * 会累积完整 reasoning 文本，并对“句尾紧跟 **标题**”做换行优化。
+	 */
+	private async handleReasoningStreamChunk(chunk: { text: string }, reasoningMessage: string): Promise<string> {
+		reasoningMessage += chunk.text
+		let formattedReasoning = reasoningMessage
+		if (reasoningMessage.includes("**")) {
+			formattedReasoning = reasoningMessage.replace(/([.!?])\*\*([^*\n]+)\*\*/g, "$1\n\n**$2**")
+		}
+		await this.say("reasoning", formattedReasoning, undefined, true)
+		return reasoningMessage
+	}
+
+	/**
+	 * 处理 usage 分片，累积 token 与费用统计。
+	 */
+	private handleUsageStreamChunk(
+		chunk: {
+			inputTokens: number
+			outputTokens: number
+			cacheWriteTokens?: number
+			cacheReadTokens?: number
+			totalCost?: number
+		},
+		current: {
+			inputTokens: number
+			outputTokens: number
+			cacheWriteTokens: number
+			cacheReadTokens: number
+			totalCost?: number
+		},
+	) {
+		return {
+			inputTokens: current.inputTokens + chunk.inputTokens,
+			outputTokens: current.outputTokens + chunk.outputTokens,
+			cacheWriteTokens: current.cacheWriteTokens + (chunk.cacheWriteTokens ?? 0),
+			cacheReadTokens: current.cacheReadTokens + (chunk.cacheReadTokens ?? 0),
+			totalCost: chunk.totalCost,
+		}
+	}
+
+	/**
+	 * 处理 grounding 分片，累积引用来源。
+	 */
+	private handleGroundingStreamChunk(
+		chunk: { sources?: GroundingSource[] },
+		pendingGroundingSources: GroundingSource[],
+	): GroundingSource[] {
+		if (chunk.sources && chunk.sources.length > 0) {
+			pendingGroundingSources.push(...chunk.sources)
+		}
+		return pendingGroundingSources
+	}
+
+	/**
+	 * 处理 tool_call_partial 分片：
+	 * 解析为 start/delta/end 事件，维护流式工具调用状态并驱动 UI/执行器更新。
+	 */
+	private async handleToolCallPartialStreamChunk(chunk: {
+		index: number
+		id?: string
+		name?: string
+		arguments?: string
+	}): Promise<void> {
+		if (!chunk.id || !chunk.name || chunk.arguments === undefined) {
+			return
+		}
+
+		const events = NativeToolCallParser.processRawChunk({
+			index: chunk.index,
+			id: chunk.id,
+			name: chunk.name,
+			arguments: chunk.arguments,
+		})
+
+		for (const event of events) {
+			if (event.type === "tool_call_start") {
+				if (this.streamingToolCallIndices.has(event.id)) {
+					console.warn(
+						`[Task#${this.taskId}] Ignoring duplicate tool_call_start for ID: ${event.id} (tool: ${event.name})`,
+					)
+					continue
+				}
+
+				NativeToolCallParser.startStreamingToolCall(event.id, event.name as ToolName)
+
+				const lastBlock = this.assistantMessageContent[this.assistantMessageContent.length - 1]
+				if (lastBlock?.type === "text" && lastBlock.partial) {
+					lastBlock.partial = false
+				}
+
+				const toolUseIndex = this.assistantMessageContent.length
+				this.streamingToolCallIndices.set(event.id, toolUseIndex)
+
+				const partialToolUse: ToolUse = {
+					type: "tool_use",
+					name: event.name as ToolName,
+					params: {},
+					partial: true,
+				}
+				;(partialToolUse as any).id = event.id
+
+				this.assistantMessageContent.push(partialToolUse)
+				this.userMessageContentReady = false
+				presentAssistantMessage(this)
+			} else if (event.type === "tool_call_delta") {
+				const partialToolUse = NativeToolCallParser.processStreamingChunk(event.id, event.delta)
+				if (partialToolUse) {
+					const toolUseIndex = this.streamingToolCallIndices.get(event.id)
+					if (toolUseIndex !== undefined) {
+						;(partialToolUse as any).id = event.id
+						this.assistantMessageContent[toolUseIndex] = partialToolUse
+						presentAssistantMessage(this)
+					}
+				}
+			} else if (event.type === "tool_call_end") {
+				const finalToolUse = NativeToolCallParser.finalizeStreamingToolCall(event.id)
+				const toolUseIndex = this.streamingToolCallIndices.get(event.id)
+
+				if (finalToolUse) {
+					;(finalToolUse as any).id = event.id
+					if (toolUseIndex !== undefined) {
+						this.assistantMessageContent[toolUseIndex] = finalToolUse
+					}
+					this.streamingToolCallIndices.delete(event.id)
+					this.userMessageContentReady = false
+					presentAssistantMessage(this)
+				} else if (toolUseIndex !== undefined) {
+					const existingToolUse = this.assistantMessageContent[toolUseIndex]
+					if (existingToolUse && existingToolUse.type === "tool_use") {
+						existingToolUse.partial = false
+						;(existingToolUse as any).id = event.id
+					}
+					this.streamingToolCallIndices.delete(event.id)
+					this.userMessageContentReady = false
+					presentAssistantMessage(this)
+				}
+			}
+		}
+	}
+
+	/**
+	 * 处理完整 tool_call 分片（兼容路径）。
+	 */
+	private async handleToolCallStreamChunk(chunk: { id: string; name: string; arguments: string }): Promise<void> {
+		const toolUse = NativeToolCallParser.parseToolCall({
+			id: chunk.id,
+			name: chunk.name as ToolName,
+			arguments: chunk.arguments,
+		})
+
+		if (!toolUse) {
+			console.error(`Failed to parse tool call for task ${this.taskId}:`, chunk)
+			return
+		}
+
+		toolUse.id = chunk.id
+		this.assistantMessageContent.push(toolUse)
+		this.userMessageContentReady = false
+		presentAssistantMessage(this)
+	}
+
+	/**
+	 * 处理 text 分片：累积 assistant 文本并增量刷新显示块。
+	 */
+	private handleTextStreamChunk(chunk: { text: string }, assistantMessage: string): string {
+		assistantMessage += chunk.text
+		const lastBlock = this.assistantMessageContent[this.assistantMessageContent.length - 1]
+		if (lastBlock?.type === "text" && lastBlock.partial) {
+			lastBlock.content = assistantMessage
+		} else {
+			this.assistantMessageContent.push({
+				type: "text",
+				content: assistantMessage,
+				partial: true,
+			})
+			this.userMessageContentReady = false
+		}
+		presentAssistantMessage(this)
+		return assistantMessage
 	}
 
 	private async getSystemPrompt(): Promise<string> {
